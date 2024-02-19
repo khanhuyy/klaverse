@@ -1,3 +1,7 @@
 go 1.21.6
 
-use ./klapify
+use (
+	./aircade
+	./klapify
+	./klatube-be
+)
