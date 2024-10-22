@@ -1,0 +1,341 @@
+package repository
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"strings"
+	"time"
+
+	"gorm.io/gorm/clause"
+
+	"github.com/honganh-vn/monorepo/services/fulfillment_be/model"
+	"github.com/honganh-vn/monorepo/services/fulfillment_be/pkg/errorz"
+	"github.com/honganh-vn/monorepo/services/lib/db"
+
+	"github.com/pkg/errors"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"gorm.io/gorm"
+
+	wm "github.com/honganh-vn/monorepo/services/lib/wrapper_message"
+
+	pb "github.com/honganh-vn/monorepo/services/fulfillment_be/api/gen/fulfillment/v1"
+	"github.com/honganh-vn/monorepo/services/fulfillment_be/internal/errordetails"
+	types "github.com/honganh-vn/monorepo/services/fulfillment_be/pkg/const"
+)
+
+type GetByID[K, T any] interface {
+	GetByID(ctx context.Context, id K) (*T, error)
+}
+
+func singleWithID[T any](db *gorm.DB, id int64) (T, error) {
+	var t T
+	if err := db.Model(t).Find(&t, id).Error; err != nil {
+		var t2 T
+		return t2, err
+	}
+	return t, nil
+}
+
+func GetOneForValidate[T any](db *gorm.DB, id int64) (*T, error) {
+	var item T
+	err := db.First(&item, id).Error
+	// check if error is db error or record not found error
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func GetEntitiesByIDs[T model.IModel](db *gorm.DB, ids []int64, lock *bool) ([]T, error) {
+	var entities []T
+	if lock != nil && *lock {
+		db = db.Clauses(clause.Locking{Strength: "UPDATE"})
+	}
+	if len(ids) > 0 {
+		db = db.Where("id IN (?)", ids)
+	}
+	err := db.Find(&entities).Error
+	if err != nil {
+		return nil, err
+	}
+
+	return entities, nil
+}
+
+func GetWithConditions[T model.IModel](db *gorm.DB, condition map[string]interface{}) ([]T, error) {
+	var entities []T
+	err := db.Where(condition).Find(&entities).Error
+	if err != nil {
+		return nil, err
+	}
+	return entities, nil
+}
+
+func multiWithWhere[T any](db *gorm.DB, where T, p *Paging) ([]T, error) {
+	var rows []T
+	var row T
+	if reflect.DeepEqual(where, row) {
+		return nil, errors.New("look like a select *")
+	}
+	db = db.Model(row)
+	db = p.update(db)
+	if err := db.Find(&rows, where).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func ErrAboutDatabase(err error, msg string) error {
+	st := status.New(codes.Internal, "internal error")
+	st, err2 := st.WithDetails(&errdetails.ErrorInfo{
+		Metadata: map[string]string{
+			errordetails.Code:    errordetails.DatabaseError,
+			errordetails.RootMsg: msg,
+			errordetails.RootErr: err.Error(),
+		},
+	})
+	if err2 != nil {
+		panic(err2)
+	}
+	return st.Err()
+}
+
+type ModelMixin struct {
+	ID        int       `gorm:"column:id;type:INT;primaryKey; autoIncrement" json:"id"`
+	CreatedAt time.Time `gorm:"column:created_at;type:DATETIME DEFAULT CURRENT_TIMESTAMP" json:"createdAt"`
+	UpdatedAt time.Time `gorm:"column:updated_at;type:DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP" json:"updatedAt"`
+}
+
+type MisaID string
+
+type MisaMixin struct {
+	MisaID MisaID `gorm:"column:misa_id;type:VARCHAR(100);unique" json:"misaId"`
+}
+
+type PaginationOptions struct {
+	Offset          int64
+	Limit           int64
+	IsCheckNextPage bool
+	SkipTotalCount  bool
+}
+
+type PaginationData struct {
+	Total   int64
+	Offset  int64
+	Limit   int64
+	HasNext *bool
+}
+
+func (pr PaginationData) ToPaginationResponse() *pb.PaginationResponse {
+	return &pb.PaginationResponse{
+		Total:   pr.Total,
+		Offset:  pr.Offset,
+		Limit:   pr.Limit,
+		HasNext: wm.ToBoolValue(pr.HasNext),
+	}
+}
+
+func (pr PaginationData) MethodCuaPaginationData() *pb.PaginationResponse {
+	return &pb.PaginationResponse{
+		Total:  pr.Total,
+		Offset: pr.Offset,
+		Limit:  pr.Limit,
+	}
+}
+
+// NewPaginationOptionsFromPb create pagination options From pb request
+func NewPaginationOptionsFromPb(input *pb.PaginationRequest) PaginationOptions {
+	options := PaginationOptions{}
+	if input == nil {
+		return options
+	}
+	if input.Offset != nil {
+		options.Offset = input.Offset.Value
+	}
+	if input.Limit != nil {
+		options.Limit = input.Limit.Value
+	}
+	options.SkipTotalCount = input.SkipTotalCount
+	return options
+}
+
+func (options PaginationOptions) GetOffset() int64 {
+	return options.Offset
+}
+
+func (options PaginationOptions) GetLimit() int64 {
+	if options.Limit == 0 {
+		return 10
+	}
+	return options.Limit
+}
+
+// WithOrderBy From order value to order Query
+func WithOrderBy(query *gorm.DB, orderBy *string) *gorm.DB {
+	// default order by is id desc
+	if orderBy == nil {
+		return query.Order("id desc")
+	}
+	// else split the input string
+	var result []string
+	orderBys := strings.Split(*orderBy, ",")
+	for _, orderBy := range orderBys {
+		order := types.OrderAsc
+		if strings.HasPrefix(orderBy, "-") {
+			order = types.OrderDesc
+		}
+		field := strings.TrimPrefix(orderBy, "-")
+
+		result = append(result, fmt.Sprintf("%s %s", field, order))
+
+	}
+	return query.Order(strings.Join(result, ","))
+}
+
+type TimeRangeOptions struct {
+	From *time.Time
+	To   *time.Time
+}
+
+func NewTimeRangeOptionsFromPb(input *pb.TimeRangeFilter) *TimeRangeOptions {
+	if input == nil {
+		return nil
+	}
+	filter := &TimeRangeOptions{}
+	if input.From != nil {
+		temp := input.From.AsTime()
+		filter.From = &temp
+	}
+	if input.To != nil {
+		temp := input.To.AsTime()
+		filter.To = &temp
+	}
+	return filter
+}
+
+func WithTimeRange(query *gorm.DB, timeRange *TimeRangeOptions, tableName ...string) *gorm.DB {
+	// support filter with table name
+	if timeRange == nil {
+		return query
+	}
+	if len(tableName) > 0 {
+		table := tableName[0]
+		if timeRange.From != nil {
+			query = query.Where(fmt.Sprintf("%s.created_at >= ?", table), *timeRange.From)
+		}
+		if timeRange.To != nil {
+			query = query.Where(fmt.Sprintf("%s.created_at <= ?", table), *timeRange.To)
+		}
+	} else {
+		if timeRange.From != nil {
+			query = query.Where("created_at >= ?", *timeRange.From)
+		}
+		if timeRange.To != nil {
+			query = query.Where("created_at <= ?", *timeRange.To)
+		}
+	}
+
+	return query
+}
+func UpdateRecordByOptions[T any](query *gorm.DB, whereClause map[string]interface{}, recordMapper map[string]interface{}) error {
+	return query.Model(new(T)).Where(whereClause).Updates(recordMapper).Error
+}
+
+type QueryCondition struct {
+	query interface{}
+	args  []interface{}
+}
+
+func toOrQuery(conditions []QueryCondition, query *gorm.DB) *gorm.DB {
+	if len(conditions) == 0 {
+		return query
+	}
+	query = query.Where(conditions[0].query, conditions[0].args...)
+	for i := 1; i < len(conditions); i++ {
+		query = query.Or(conditions[i].query, conditions[i].args...)
+	}
+	return query
+}
+
+type RangeFilter struct {
+	From *int64
+	To   *int64
+}
+
+func convertRangeFilter(filterRange *pb.RangeFilter) *RangeFilter {
+	if filterRange == nil {
+		return nil
+	}
+	return &RangeFilter{
+		From: wm.FromInt64Value(filterRange.From),
+		To:   wm.FromInt64Value(filterRange.To),
+	}
+}
+
+type IFilterOptions interface {
+	ToQuery(*gorm.DB) *gorm.DB
+}
+
+type IBaseRepo[T model.IModel] interface {
+	GetByID(ctx context.Context, id int64) (T, error)
+	GetByIDs(ctx context.Context, ids []int64) ([]T, error)
+	BulkCreate(ctx context.Context, objs []T) ([]T, error)
+	Save(ctx context.Context, obj T) (T, error)
+	BulkSave(ctx context.Context, obj []T) error
+	GetBy(ctx context.Context, query IFilterOptions) ([]T, error)
+}
+
+type BaseRepository[T model.IModel] struct {
+	dbFromCtx db.GetDBFunc
+}
+
+func (r BaseRepository[T]) GetByIDs(ctx context.Context, ids []int64) ([]T, error) {
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	var result []T
+	err := _db.Where("id in ?", ids).Find(&result).Error
+	return result, err
+}
+
+func (r BaseRepository[T]) GetByID(ctx context.Context, id int64) (T, error) {
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	var result T
+	err := _db.First(&result, id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return result, errorz.RecordNotfound(ctx, fmt.Sprintf("object with id %d not found", id))
+	}
+	return result, err
+}
+
+func (r BaseRepository[T]) GetBy(ctx context.Context, query IFilterOptions) ([]T, error) {
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	var result []T
+	err := query.ToQuery(_db).Find(&result).Error
+	return result, err
+}
+
+func (r BaseRepository[T]) BulkCreate(ctx context.Context, objs []T) ([]T, error) {
+	if len(objs) == 0 {
+		return make([]T, 0), nil
+	}
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	err := _db.Create(&objs).Error
+	return objs, err
+}
+
+func (r BaseRepository[T]) Save(ctx context.Context, obj T) (T, error) {
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	err := _db.Save(obj).Error
+	return obj, err
+}
+
+func (r BaseRepository[T]) BulkSave(ctx context.Context, items []T) error {
+	if len(items) == 0 {
+		return nil
+	}
+	_db := r.dbFromCtx(ctx).WithContext(ctx)
+	err := _db.Save(items).Error
+	return err
+}
